@@ -4,7 +4,17 @@ name: Claude review
 on:
   pull_request_target:
     # No branches filter: closed/retarget events must still cancel an in-flight review.
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed, edited, unlabeled]
+    types:
+      [
+        opened,
+        reopened,
+        synchronize,
+        ready_for_review,
+        converted_to_draft,
+        closed,
+        edited,
+        unlabeled,
+      ]
 permissions: {}
 jobs:
   review:
@@ -18,5 +28,4 @@ jobs:
       issues: write
       pull-requests: write
     # Pinned to a full commit SHA, never a tag: the role trusts this exact job_workflow_ref.
-    # Placeholder: replace <40-hex-sha> with the release commit when v1.0.0 is cut.
-    uses: BASIC-BIT/claude-review/.github/workflows/review.yml@<40-hex-sha> # v1.0.0
+    uses: BASIC-BIT/claude-review/.github/workflows/review.yml@5d39ea869f2938b341459e851e294d2f8d93155e # v1.0.0
