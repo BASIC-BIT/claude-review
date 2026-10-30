@@ -28,4 +28,4 @@ jobs:
       issues: write
       pull-requests: write
     # Pinned to a full commit SHA, never a tag: the role trusts this exact job_workflow_ref.
-    uses: BASIC-BIT/claude-review/.github/workflows/review.yml@5d39ea869f2938b341459e851e294d2f8d93155e # v1.0.0
+    uses: BASIC-BIT/claude-review/.github/workflows/review.yml@b1431cc7f787fc29237d42c1bc1a184dd1db5f2a # v1.1.0

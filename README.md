@@ -77,9 +77,8 @@ the role trusts changes only when the trust policy does. A release means: add th
 trust policy beside the current one, update every caller's `uses:` to it, then remove the old SHA
 from trust. Both are accepted only during that rollout.
 
-`# v1.1.0: update to the release commit` — `templates/caller.yml` still pins v1.0.0
-(`5d39ea869f2938b341459e851e294d2f8d93155e`) until v1.1.0 is published and its SHA is added to the
-trust policy. Callers on v1.0.0 still need `.github/claude-review.json`.
+Current release: v1.1.0, `b1431cc7f787fc29237d42c1bc1a184dd1db5f2a` (pinned in `templates/caller.yml`).
+Callers still on v1.0.0 (`5d39ea869f2938b341459e851e294d2f8d93155e`) need `.github/claude-review.json`.
 
 ## Security model
 
