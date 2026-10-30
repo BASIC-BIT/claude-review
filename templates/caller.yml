@@ -5,16 +5,14 @@ on:
   pull_request_target:
     # No branches filter: closed/retarget events must still cancel an in-flight review.
     types:
-      [
-        opened,
-        reopened,
-        synchronize,
-        ready_for_review,
-        converted_to_draft,
-        closed,
-        edited,
-        unlabeled,
-      ]
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - closed
+      - edited
+      - unlabeled
 permissions: {}
 jobs:
   review:
