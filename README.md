@@ -7,31 +7,43 @@ comment. It runs on GitHub-hosted runners, needs no server, and never approves o
 
 1. Copy [`templates/caller.yml`](templates/caller.yml) to `.github/workflows/claude-review.yml` on
    the default branch. Keep `pull_request_target`, the permissions block and the pinned commit SHA.
-2. Commit `.github/claude-review.json` on the default branch:
-
-   ```json
-   {
-     "schemaVersion": 1,
-     "enabled": true,
-     "baseBranches": ["main"],
-     "skipLabels": ["skip-claude-review"],
-     "rerunOnUnskip": true,
-     "excludeGlobs": [],
-     "excludeDocsOnly": true,
-     "docsOnlyGlobs": ["docs/**"],
-     "allowBotAuthors": false,
-     "allowedBotActors": [],
-     "contextMode": "allowlist",
-     "contextAllowGlobs": ["**"],
-     "githubLinksOnly": false,
-     "instructionPaths": ["AGENTS.md"]
-   }
-   ```
-
-3. Optionally commit `REVIEW.md` (repository-specific calibration) at the root.
-4. Ask the role owner to add the repository's OIDC subject to the role's trust policy. The trust policy is maintained privately; it allows the token only when `job_workflow_ref` is this workflow at an approved commit SHA, `ref` is the repository's default branch (so only `pull_request_target` callers qualify) and `sub` is an enrolled repository's `pull_request` subject.
+   That file is the only one adoption needs (from v1.1.0; v1.0.0 still requires a policy file).
+2. Ask the role owner to add the repository's OIDC subject to the role's trust policy. The trust policy is maintained privately; it allows the token only when `job_workflow_ref` is this workflow at an approved commit SHA, `ref` is the repository's default branch (so only `pull_request_target` callers qualify) and `sub` is an enrolled repository's `pull_request` subject.
    Until then the token step fails and the sticky says the review did not complete.
-5. Remove the old reviewer workflow in the same change so each PR has one publisher.
+3. Remove the old reviewer workflow in the same change so each PR has one publisher.
+
+### Defaults and overrides
+
+Both policy files are optional. Without `.github/claude-review.json` the workflow uses:
+
+```json
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "baseBranches": ["<the repository's default branch>"],
+  "skipLabels": ["skip-claude-review"],
+  "rerunOnUnskip": true,
+  "excludeGlobs": [],
+  "excludeDocsOnly": false,
+  "docsOnlyGlobs": ["docs/**"],
+  "allowBotAuthors": false,
+  "allowedBotActors": [],
+  "contextMode": "allowlist",
+  "contextAllowGlobs": ["**"],
+  "githubLinksOnly": false,
+  "instructionPaths": ["AGENTS.md", "CLAUDE.md"]
+}
+```
+
+The default branch comes from the event's repository data, and `instructionPaths` lists only
+whichever of the root `AGENTS.md` and `CLAUDE.md` exist at the trusted commit. Without `REVIEW.md`
+a short built-in contract applies: report correctness, security and privacy, regression,
+operational, data-loss and concurrency problems at P0 to P2, each with `path:line`, impact and the
+smallest fix.
+
+To override, commit either file on the default branch. A present `.github/claude-review.json`
+replaces the defaults entirely (fields are not merged), so write every required field; the example
+above is a complete starting point. A present `REVIEW.md` replaces the built-in contract.
 
 | Field | Effect |
 | --- | --- |
@@ -47,8 +59,9 @@ comment. It runs on GitHub-hosted runners, needs no server, and never approves o
 | `githubLinksOnly` | Replace every non-`https://github.com` URL in the published comment |
 | `instructionPaths` | Extra trusted instruction files, read from the base commit |
 
-Missing or invalid policy fails the job before any credential is requested. Unknown fields are
-ignored. The policy, `REVIEW.md` and `instructionPaths` are read from the default-branch commit
+A missing policy uses the defaults. A present but invalid policy (bad JSON, another
+`schemaVersion`, or a failed field check) fails the job before any credential is requested.
+Unknown fields are ignored. The policy, `REVIEW.md` and `instructionPaths` are read from the default-branch commit
 the event ran on (`github.sha`), so a PR's edits to them are reviewed as data and take effect only
 after merge.
 
@@ -63,6 +76,10 @@ role's trust policy lists that same SHA in `job_workflow_ref`. A SHA cannot be m
 the role trusts changes only when the trust policy does. A release means: add the new SHA to the
 trust policy beside the current one, update every caller's `uses:` to it, then remove the old SHA
 from trust. Both are accepted only during that rollout.
+
+`# v1.1.0: update to the release commit` — `templates/caller.yml` still pins v1.0.0
+(`5d39ea869f2938b341459e851e294d2f8d93155e`) until v1.1.0 is published and its SHA is added to the
+trust policy. Callers on v1.0.0 still need `.github/claude-review.json`.
 
 ## Security model
 

@@ -3,9 +3,10 @@ name: Claude review
 # Shared advisory Claude PR reviewer. Called from a per-repository pull_request_target caller
 # (templates/caller.yml). Callers cannot add steps to these jobs and this file declares no
 # inputs or secrets: prompt, tools, deny rules, model, role and limits live here, and the only
-# per-repository behavior comes from .github/claude-review.json, REVIEW.md and instructionPaths
-# read at the trusted default-branch commit (github.sha, which pull_request_target sets to the
-# base branch tip). Nothing from the PR head is ever executed. See README.md.
+# per-repository behavior comes from the optional .github/claude-review.json, REVIEW.md and
+# instructionPaths read at the trusted default-branch commit (github.sha, which
+# pull_request_target sets to the base branch tip); absent files get built-in defaults. Nothing
+# from the PR head is ever executed. See README.md.
 on:
   workflow_call: {}
 
@@ -38,8 +39,76 @@ jobs:
       available: ${{ steps.live.outputs.available == 'true' }}
       allowed_bots: ${{ steps.live.outputs.allowed_bots }}
       github_links_only: ${{ steps.live.outputs.github_links_only }}
+      # The effective policy, resolved once here; later jobs use this instead of re-reading it.
+      policy: ${{ steps.policy.outputs.json }}
     steps:
-      - name: Check live PR state and trusted policy
+      - name: Check out trusted base
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve trusted policy
+        id: policy
+        # Read from the trusted commit's object database, never the PR. Only an absent policy
+        # file gets defaults; a present one that fails validation fails closed (red, no OIDC).
+        env:
+          TRUSTED_SHA: ${{ github.sha }}
+          # Trusted event data about the base repository, never PR-controlled input.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy="${RUNNER_TEMP}/policy.json"
+          git cat-file -e "${TRUSTED_SHA}^{commit}" \
+            || { echo "::error::Trusted commit ${TRUSTED_SHA} is not available."; exit 1; }
+
+          # Any object at the path (even a directory or symlink) counts as present.
+          if git cat-file -e "${TRUSTED_SHA}:${POLICY_PATH}" 2>/dev/null; then
+            git show "${TRUSTED_SHA}:${POLICY_PATH}" > "$policy"
+          else
+            # Defaults can express nothing a present policy cannot. Root AGENTS.md and CLAUDE.md
+            # become instructions when they exist as files at the trusted commit.
+            found=()
+            for f in AGENTS.md CLAUDE.md; do
+              if [ "$(git cat-file -t "${TRUSTED_SHA}:${f}" 2>/dev/null)" = "blob" ]; then found+=("$f"); fi
+            done
+            echo "::notice::No ${POLICY_PATH} at ${TRUSTED_SHA}; using built-in defaults."
+            jq -n --arg b "$DEFAULT_BRANCH" '{
+              schemaVersion: 1, enabled: true, baseBranches: [$b],
+              skipLabels: ["skip-claude-review"], rerunOnUnskip: true,
+              excludeGlobs: [], excludeDocsOnly: false, docsOnlyGlobs: ["docs/**"],
+              allowBotAuthors: false, allowedBotActors: [],
+              contextMode: "allowlist", contextAllowGlobs: ["**"],
+              githubLinksOnly: false, instructionPaths: $ARGS.positional
+            }' --args "${found[@]}" > "$policy"
+          fi
+
+          # Defaults go through the same validator (an empty default branch fails here). Slurped so
+          # an empty file or several JSON values fail instead of passing -e or splitting the output.
+          jq -e -s '
+            def strs: type == "array" and all(.[]; type == "string" and length > 0);
+            def paths: strs and all(.[]; (startswith("/") or startswith(":") or test("(^|/)\\.\\.(/|$)")) | not);
+            length == 1 and (.[0] |
+            type == "object" and .schemaVersion == 1
+            and (.enabled | type == "boolean")
+            and (.baseBranches | strs)
+            and (.skipLabels | strs)
+            and (.rerunOnUnskip | type == "boolean")
+            and ((.excludeGlobs // []) | paths)
+            and ((.excludeDocsOnly // false) | type == "boolean")
+            and (if .excludeDocsOnly then (.docsOnlyGlobs | paths) and (.docsOnlyGlobs | length > 0) else true end)
+            and (.allowBotAuthors | type == "boolean")
+            and (.allowedBotActors | strs)
+            and ((.contextMode // "allowlist") == "allowlist")
+            and ((.contextAllowGlobs // ["**"]) | paths)
+            and ((.githubLinksOnly // false) | type == "boolean")
+            and ((.instructionPaths // []) | paths))
+          ' "$policy" > /dev/null \
+            || { echo "::error::Claude review policy error: ${POLICY_PATH} at ${TRUSTED_SHA} is not a valid schemaVersion 1 policy."; exit 1; }
+          echo "json=$(jq -c . "$policy")" >> "$GITHUB_OUTPUT"
+
+      - name: Check live PR state and policy
         id: live
         # Validates live state, not the event payload: a manual re-run replays its original
         # payload, which can name a superseded head or predate a skip label.
@@ -62,13 +131,9 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           }
-          fail() {
-            echo "::error::Claude review policy error: $1"
-            exit 1
-          }
 
           pr="${RUNNER_TEMP}/pr.json"
-          policy="${RUNNER_TEMP}/policy.json"
+          policy="${RUNNER_TEMP}/policy.json" # written and validated by the previous step
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$pr"
           default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
 
@@ -85,29 +150,6 @@ jobs:
           # The policy commit must still be on the live default branch (no force-pushed-away policy).
           compare="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${TRUSTED_SHA}...${default_branch}" --jq '.status')"
           case "$compare" in identical|ahead) ;; *) stop "trusted commit ${TRUSTED_SHA} is not on ${default_branch}." ;; esac
-
-          # Missing or invalid policy fails closed (red job, no OIDC).
-          gh api "repos/${GITHUB_REPOSITORY}/contents/${POLICY_PATH}?ref=${TRUSTED_SHA}" \
-            -H "Accept: application/vnd.github.raw" > "$policy" \
-            || fail "${POLICY_PATH} is missing at ${TRUSTED_SHA}."
-          jq -e '
-            def strs: type == "array" and all(.[]; type == "string" and length > 0);
-            def paths: strs and all(.[]; (startswith("/") or startswith(":") or test("(^|/)\\.\\.(/|$)")) | not);
-            type == "object" and .schemaVersion == 1
-            and (.enabled | type == "boolean")
-            and (.baseBranches | strs)
-            and (.skipLabels | strs)
-            and (.rerunOnUnskip | type == "boolean")
-            and ((.excludeGlobs // []) | paths)
-            and ((.excludeDocsOnly // false) | type == "boolean")
-            and (if .excludeDocsOnly then (.docsOnlyGlobs | paths) and (.docsOnlyGlobs | length > 0) else true end)
-            and (.allowBotAuthors | type == "boolean")
-            and (.allowedBotActors | strs)
-            and ((.contextMode // "allowlist") == "allowlist")
-            and ((.contextAllowGlobs // ["**"]) | paths)
-            and ((.githubLinksOnly // false) | type == "boolean")
-            and ((.instructionPaths // []) | paths)
-          ' "$policy" > /dev/null || fail "${POLICY_PATH} at ${TRUSTED_SHA} is not a valid schemaVersion 1 policy."
 
           [ "$(jq -r '.enabled' "$policy")" = "true" ] || stop "policy disables Claude review."
           jq -e --arg b "$PR_BASE_REF" '.baseBranches | index($b)' "$policy" > /dev/null \
@@ -187,6 +229,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          POLICY_JSON: ${{ needs.gate.outputs.policy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -197,10 +240,12 @@ jobs:
             exit 0
           }
 
-          # Policy, REVIEW.md and instructionPaths come from the trusted commit's object database,
-          # never from the head tree, so a PR cannot weaken the review judging it.
+          # Policy (resolved by the gate), REVIEW.md and instructionPaths come from the trusted
+          # commit's object database, never from the head tree, so a PR cannot weaken the review
+          # judging it.
           policy="${RUNNER_TEMP}/policy.json"
-          git show "${TRUSTED_SHA}:${POLICY_PATH}" > "$policy"
+          printf '%s\n' "$POLICY_JSON" > "$policy"
+          jq -e 'type == "object"' "$policy" > /dev/null || { echo "::error::Gate produced no policy."; exit 1; }
 
           # Pathspecs come from trusted policy; glob magic gives gitignore-style ** semantics.
           excludes=()
@@ -256,8 +301,21 @@ jobs:
           if git cat-file -e "${TRUSTED_SHA}:REVIEW.md" 2>/dev/null; then
             git show "${TRUSTED_SHA}:REVIEW.md" > .claude-review/REVIEW.md
           else
-            echo "REVIEW.md" >> .claude-review/missing-instructions.txt
-            echo "_No REVIEW.md on ${BASE_REF}; use the prompt alone._" > .claude-review/REVIEW.md
+            # Built-in generic contract; a repository overrides it by committing REVIEW.md.
+            cat > .claude-review/REVIEW.md <<'EOF'
+          # Review contract (built-in default)
+
+          This repository has no REVIEW.md, so this generic contract applies.
+
+          - Report only problems that matter: correctness bugs, security or privacy problems,
+            regressions, operational risk, data loss, and concurrency or ordering hazards.
+          - Priorities: P0 breaks production, loses or exposes data, or opens a security hole. P1 is
+            a likely bug or regression to fix before merging. P2 is a real but lower-risk problem.
+            P0 and P1 are Important.
+          - Every finding needs `path:line`, the concrete impact, and the smallest fix.
+          - Skip style, naming, formatting and praise.
+          - End with exactly one line: `Important findings found.` or `No Important findings.`
+          EOF
           fi
           while IFS= read -r p; do
             if [ "$(git cat-file -t "${TRUSTED_SHA}:${p}" 2>/dev/null)" = "blob" ]; then
@@ -288,15 +346,15 @@ jobs:
         if: steps.context.outputs.status == 'review'
         env:
           GH_TOKEN: ${{ github.token }}
-          TRUSTED_SHA: ${{ github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          POLICY_JSON: ${{ needs.gate.outputs.policy }}
         shell: bash
         run: |
           set -euo pipefail
           [ ! -e "${GITHUB_WORKSPACE}/pr-head" ] || { echo "::error::PR head checkout still present."; exit 1; }
-          skip_labels="$(git show "${TRUSTED_SHA}:${POLICY_PATH}" | jq -c '.skipLabels')"
+          skip_labels="$(jq -c '.skipLabels' <<< "$POLICY_JSON")"
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" | jq -e \
             --arg head "$PR_HEAD_SHA" --arg ref "$PR_BASE_REF" --arg repo "$GITHUB_REPOSITORY" --argjson skip "$skip_labels" '
               .state == "open" and .draft == false and .head.sha == $head and .base.ref == $ref
@@ -526,6 +584,7 @@ jobs:
           REVIEW_STATUS: ${{ needs.review.outputs.status }}
           REVIEW_MARKDOWN_B64: ${{ needs.review.outputs.review_markdown_b64 }}
           GITHUB_LINKS_ONLY: ${{ needs.gate.outputs.github_links_only }}
+          POLICY_JSON: ${{ needs.gate.outputs.policy }}
         shell: bash
         run: |
           set -euo pipefail
@@ -567,8 +626,7 @@ jobs:
 
           pr="${RUNNER_TEMP}/pr.json"
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$pr"
-          skip_labels="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${POLICY_PATH}?ref=${TRUSTED_SHA}" \
-            -H "Accept: application/vnd.github.raw" | jq -c '.skipLabels')"
+          skip_labels="$(jq -c '.skipLabels' <<< "$POLICY_JSON")"
           live_head="$(jq -r '.head.sha' "$pr")"
 
           [ "$(jq -r '.state' "$pr")" = "open" ] || { echo "::notice::Not publishing: PR is not open."; exit 0; }
