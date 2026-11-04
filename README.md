@@ -107,7 +107,11 @@ Callers still on v1.0.0 (`5d39ea869f2938b341459e851e294d2f8d93155e`) need `.gith
   instead of deleting it, and never replaces a completed review of the same head with a failure.
 - **Actions** are pinned by full commit SHA.
 
-**Recommended repository setting.** Set GitHub Actions default workflow permissions to read-only
-in every consumer repository or organization. Otherwise any workflow on a same-repository branch
-gets a writable `GITHUB_TOKEN` and can post comments as `github-actions[bot]` that look exactly
-like this reviewer's sticky. This is a settings change BASIC makes; the workflow cannot enforce it.
+**Known limit: imitated review comments.** The sticky review is posted as `github-actions[bot]`,
+and anyone who can push a branch can run a workflow on that branch that posts as the same
+identity. A read-only default `GITHUB_TOKEN` does not stop this, because a workflow can request
+`pull-requests: write` in its own `permissions` block. This is an accepted risk: only people and
+agents who can already push to the repository can do it, the reviewer treats any previous comment
+as untrusted input, and a genuine review names the exact head and base commits it covered. Keep
+read-only defaults as hygiene. If imitation ever becomes a practical problem, the fix is to publish
+under a dedicated GitHub App identity.
