@@ -1,9 +1,10 @@
-name: Claude review
+name: Basic PR Review
 
-# Shared advisory Claude PR reviewer. Called from a per-repository pull_request_target caller
-# (templates/caller.yml). Callers cannot add steps to these jobs and this file declares no
+# Shared advisory PR reviewer (basic-pr-review). Called from a per-repository pull_request_target
+# caller (templates/caller.yml). Callers cannot add steps to these jobs and this file declares no
 # inputs or secrets: prompt, tools, deny rules, model, role and limits live here, and the only
-# per-repository behavior comes from the optional .github/claude-review.json, REVIEW.md and
+# per-repository behavior comes from the optional .github/basic-pr-review.json (or the legacy
+# .github/claude-review.json), REVIEW.md and
 # instructionPaths read at the trusted default-branch commit (github.sha, which
 # pull_request_target sets to the base branch tip); absent files get built-in defaults. Nothing
 # from the PR head is ever executed. See README.md.
@@ -13,19 +14,27 @@ on:
 permissions: {}
 
 env:
-  STICKY_MARKER: "<!-- claude-pr-review -->"
-  POLICY_PATH: .github/claude-review.json
+  STICKY_MARKER: "<!-- basic-pr-review -->"
+  # Read, never written, so open PRs keep their v1.1 sticky; the next publish converts it.
+  LEGACY_STICKY_MARKER: "<!-- claude-pr-review -->"
+  POLICY_PATH: .github/basic-pr-review.json
+  LEGACY_POLICY_PATH: .github/claude-review.json
+  # Commit status a ruleset can require. Not the job check runs: label and edit events start
+  # runs on the same head whose skipped jobs read as passing.
+  STATUS_CONTEXT: basic-pr-review
 
 jobs:
   gate:
-    name: Check Claude review eligibility
+    name: Check eligibility
     # First of three guards in front of OIDC (this condition, the live check below, and the
     # repeated condition on the review job). Same-repository identity, not the fork bit: a
-    # maintained repository that is itself a fork must keep its internal PRs.
+    # maintained repository that is itself a fork must keep its internal PRs. A draft passes
+    # here only on a labeled event; the live check accepts it only for a request label the
+    # live PR still carries.
     if: >-
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.state == 'open' &&
-      !github.event.pull_request.draft &&
+      (!github.event.pull_request.draft || github.event.action == 'labeled') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.base.repo.full_name == github.repository &&
       github.event.pull_request.head.repo.id == github.event.pull_request.base.repo.id &&
@@ -35,6 +44,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # Exemption and accepted-findings statuses; this job never holds AWS credentials.
+      statuses: write
     outputs:
       available: ${{ steps.live.outputs.available == 'true' }}
       allowed_bots: ${{ steps.live.outputs.allowed_bots }}
@@ -63,9 +74,12 @@ jobs:
           git cat-file -e "${TRUSTED_SHA}^{commit}" \
             || { echo "::error::Trusted commit ${TRUSTED_SHA} is not available."; exit 1; }
 
-          # Any object at the path (even a directory or symlink) counts as present.
-          if git cat-file -e "${TRUSTED_SHA}:${POLICY_PATH}" 2>/dev/null; then
-            git show "${TRUSTED_SHA}:${POLICY_PATH}" > "$policy"
+          # Any object at the path (even a directory or symlink) counts as present. The legacy
+          # path is read only when the new one is absent.
+          path="$POLICY_PATH"
+          git cat-file -e "${TRUSTED_SHA}:${path}" 2>/dev/null || path="$LEGACY_POLICY_PATH"
+          if git cat-file -e "${TRUSTED_SHA}:${path}" 2>/dev/null; then
+            git show "${TRUSTED_SHA}:${path}" > "$policy"
           else
             # Defaults can express nothing a present policy cannot. Root AGENTS.md and CLAUDE.md
             # become instructions when they exist as files at the trusted commit.
@@ -76,11 +90,13 @@ jobs:
             echo "::notice::No ${POLICY_PATH} at ${TRUSTED_SHA}; using built-in defaults."
             jq -n --arg b "$DEFAULT_BRANCH" '{
               schemaVersion: 1, enabled: true, baseBranches: [$b],
-              skipLabels: ["skip-claude-review"], rerunOnUnskip: true,
+              skipLabels: ["skip-pr-review", "skip-claude-review"], rerunOnUnskip: true,
               excludeGlobs: [], excludeDocsOnly: false, docsOnlyGlobs: ["docs/**"],
               allowBotAuthors: false, allowedBotActors: [],
               contextMode: "allowlist", contextAllowGlobs: ["**"],
-              githubLinksOnly: false, instructionPaths: $ARGS.positional
+              githubLinksOnly: false, instructionPaths: $ARGS.positional,
+              requestLabels: ["request-pr-review"], failOnImportant: false,
+              acceptFindingsLabels: ["pr-review-accepted"]
             }' --args "${found[@]}" > "$policy"
           fi
 
@@ -103,10 +119,17 @@ jobs:
             and ((.contextMode // "allowlist") == "allowlist")
             and ((.contextAllowGlobs // ["**"]) | paths)
             and ((.githubLinksOnly // false) | type == "boolean")
-            and ((.instructionPaths // []) | paths))
+            and ((.instructionPaths // []) | paths)
+            and ((.requestLabels // []) | strs)
+            and ((.failOnImportant // false) | type == "boolean")
+            and ((.acceptFindingsLabels // []) | strs))
           ' "$policy" > /dev/null \
-            || { echo "::error::Claude review policy error: ${POLICY_PATH} at ${TRUSTED_SHA} is not a valid schemaVersion 1 policy."; exit 1; }
-          echo "json=$(jq -c . "$policy")" >> "$GITHUB_OUTPUT"
+            || { echo "::error::PR review policy error: ${path} at ${TRUSTED_SHA} is not a valid schemaVersion 1 policy."; exit 1; }
+          # Fill the optional v1.2 fields once so every later reader can rely on them.
+          jq -c '.requestLabels //= ["request-pr-review"] | .failOnImportant //= false
+            | .acceptFindingsLabels //= ["pr-review-accepted"]' "$policy" > "${policy}.tmp"
+          mv "${policy}.tmp" "$policy"
+          echo "json=$(cat "$policy")" >> "$GITHUB_OUTPUT"
 
       - name: Check live PR state and policy
         id: live
@@ -126,19 +149,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           stop() {
-            echo "::notice::Skipping Claude review: $1"
+            echo "::notice::Skipping PR review: $1"
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           }
+          # Only ever for the live head: re-read just before posting.
+          post_status() {
+            [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')" = "$PR_HEAD_SHA" ] \
+              || { echo "::notice::Head moved; no status for ${PR_HEAD_SHA}."; return 0; }
+            jq -n --arg s "$1" --arg d "$2" --arg u "$run_url" --arg c "$STATUS_CONTEXT" \
+              '{state: $s, description: $d, target_url: $u, context: $c}' \
+              | gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" --input - > /dev/null
+          }
+          # Policy exemptions would block merging forever, so they pass the required status.
+          exempt() { post_status success "$1"; stop "$1"; }
+          has_label() { jq -e --arg l "$1" '[.labels[].name] | index($l)' "$pr" > /dev/null; }
+          policy_has() { jq -e --arg k "$1" --arg l "$2" '.[$k] | index($l)' "$policy" > /dev/null; }
 
           pr="${RUNNER_TEMP}/pr.json"
           policy="${RUNNER_TEMP}/policy.json" # written and validated by the previous step
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$pr"
           default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          fail_on_important="$(jq -r '.failOnImportant' "$policy")"
+
+          # A review request is a labeled event for a request label the live PR still carries.
+          request=false
+          if [ "$EVENT_ACTION" = "labeled" ] && policy_has requestLabels "$LABEL_NAME" && has_label "$LABEL_NAME"; then
+            request=true
+          fi
 
           [ "$(jq -r '.state' "$pr")" = "open" ] || stop "PR #${PR_NUMBER} is not open."
-          [ "$(jq -r '.draft' "$pr")" = "false" ] || stop "PR #${PR_NUMBER} is a draft."
+          [ "$(jq -r '.draft' "$pr")" = "false" ] || [ "$request" = true ] || stop "PR #${PR_NUMBER} is a draft."
           [ "$(jq -r '.head.repo.full_name // ""' "$pr")" = "${GITHUB_REPOSITORY}" ] \
             || stop "PR #${PR_NUMBER} does not come from a branch of ${GITHUB_REPOSITORY}."
           [ "$(jq -r '.head.repo.id // ""' "$pr")" = "$(jq -r '.base.repo.id' "$pr")" ] \
@@ -151,29 +194,71 @@ jobs:
           compare="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${TRUSTED_SHA}...${default_branch}" --jq '.status')"
           case "$compare" in identical|ahead) ;; *) stop "trusted commit ${TRUSTED_SHA} is not on ${default_branch}." ;; esac
 
-          [ "$(jq -r '.enabled' "$policy")" = "true" ] || stop "policy disables Claude review."
-          jq -e --arg b "$PR_BASE_REF" '.baseBranches | index($b)' "$policy" > /dev/null \
-            || stop "policy baseBranches does not include ${PR_BASE_REF}."
-          jq -e --slurpfile p "$policy" '[.labels[].name] - ($p[0].skipLabels) == [.labels[].name]' "$pr" > /dev/null \
-            || stop "PR #${PR_NUMBER} carries a skip label."
-
+          # Noise (other labels, title edits) stops here and posts nothing. Skip and accept labels
+          # only update the status; they never start a review.
+          mode=review
           case "$EVENT_ACTION" in
+            labeled)
+              if [ "$request" = true ]; then :
+              elif policy_has skipLabels "$LABEL_NAME"; then mode=status
+              elif [ "$fail_on_important" = true ] && policy_has acceptFindingsLabels "$LABEL_NAME"; then mode=verdict
+              else stop "label ${LABEL_NAME} does not request a review."
+              fi
+              ;;
             unlabeled)
-              jq -e --arg l "$LABEL_NAME" '.rerunOnUnskip and (.skipLabels | index($l))' "$policy" > /dev/null \
-                || stop "label removal does not request a review."
+              if policy_has skipLabels "$LABEL_NAME"; then
+                [ "$(jq -r '.rerunOnUnskip' "$policy")" = "true" ] || mode=unskipped
+              elif [ "$fail_on_important" = true ] && policy_has acceptFindingsLabels "$LABEL_NAME"; then mode=verdict
+              else stop "label removal does not request a review."
+              fi
               ;;
             edited)
               [ -n "$BASE_CHANGED_FROM" ] || stop "edit did not change the base branch."
               ;;
           esac
 
+          [ "$(jq -r '.enabled' "$policy")" = "true" ] || exempt "Exempt: review is disabled by policy."
+          jq -e --arg b "$PR_BASE_REF" '.baseBranches | index($b)' "$policy" > /dev/null \
+            || stop "policy baseBranches does not include ${PR_BASE_REF}."
+          jq -e --slurpfile p "$policy" '[.labels[].name] - ($p[0].skipLabels) == [.labels[].name]' "$pr" > /dev/null \
+            || exempt "Exempt: skipped by label."
+
           if [ "$(jq -r '.user.type' "$pr")" = "Bot" ] && [ "$(jq -r '.allowBotAuthors' "$policy")" != "true" ]; then
-            stop "bot-authored PRs are not reviewed by policy."
+            exempt "Exempt: bot-authored PRs are not reviewed by policy."
           fi
           if [ "$SENDER_TYPE" = "Bot" ] || [[ "$SENDER_LOGIN" == *"[bot]" ]]; then
             jq -e --arg a "$SENDER_LOGIN" '.allowedBotActors | (index("*") or index($a))' "$policy" > /dev/null \
               || stop "bot actor ${SENDER_LOGIN} is not allowed by policy."
           fi
+
+          case "$mode" in
+            status) stop "skip label ${LABEL_NAME} is no longer present." ;;
+            unskipped)
+              post_status pending "Skip label removed; push or add a request label to review."
+              stop "skip label removed and rerunOnUnskip is false."
+              ;;
+            verdict)
+              # Re-derive the status from the published sticky for exactly this head, without the
+              # model. Trusted only from github-actions[bot] with this head's completion marker.
+              COMPLETE_MARKER="<!-- basic-pr-review-complete head=${PR_HEAD_SHA} ref=${PR_BASE_REF} -->"
+              export COMPLETE_MARKER
+              ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.COMPLETE_MARKER))) | .id')"
+              [ -n "$ids" ] || stop "no published review of ${PR_HEAD_SHA} to re-evaluate."
+              gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${ids%%$'\n'*}" --jq '.body' > "${RUNNER_TEMP}/sticky.md"
+              verdict="$(awk '!/^<!-- basic-pr-review/ && NF { l = $0 } END { gsub(/^[ \t\r]+|[ \t\r]+$/, "", l); print l }' "${RUNNER_TEMP}/sticky.md")"
+              if jq -e --slurpfile p "$policy" '[.labels[].name] - ($p[0].acceptFindingsLabels) != [.labels[].name]' "$pr" > /dev/null; then
+                post_status success "Review published; findings accepted by label."
+              elif [ "$verdict" = "No Important findings." ]; then
+                post_status success "Review published; no Important findings."
+              elif [ "$verdict" = "Important findings found." ]; then
+                post_status failure "Important findings found. Fix them or add an accept label."
+              else
+                post_status failure "The published review has no verdict line; re-run the review."
+              fi
+              stop "status re-evaluated from the published review of ${PR_HEAD_SHA}."
+              ;;
+          esac
 
           {
             echo "allowed_bots=$(jq -r '.allowedBotActors | join(",")' "$policy")"
@@ -182,7 +267,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   review:
-    name: Generate Claude review
+    name: Generate review
     needs: gate
     # Repeated so the only job holding id-token: write does not rely on another job's output alone.
     if: >-
@@ -331,12 +416,12 @@ jobs:
           # bot login are not proof of authorship (any same-repo workflow can post as
           # github-actions[bot]), so the prompt treats this file as untrusted data.
           if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.STICKY_MARKER))) | .body' \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | (contains(env.STICKY_MARKER) or contains(env.LEGACY_STICKY_MARKER)))) | .body' \
               > "${RUNNER_TEMP}/previous-review.md"; then
-            echo "_Could not read the previous Claude review._" > "${RUNNER_TEMP}/previous-review.md"
+            echo "_Could not read the previous review._" > "${RUNNER_TEMP}/previous-review.md"
           fi
           head -c 45000 "${RUNNER_TEMP}/previous-review.md" | iconv -f utf-8 -t utf-8 -c > .claude-review/previous-review.md || true
-          [ -s .claude-review/previous-review.md ] || echo "_No previous Claude review on this PR._" > .claude-review/previous-review.md
+          [ -s .claude-review/previous-review.md ] || echo "_No previous review on this PR._" > .claude-review/previous-review.md
 
           # Nothing PR-controlled other than the generated diff may exist once the credential does.
           rm -rf -- "${GITHUB_WORKSPACE}/pr-head"
@@ -349,17 +434,24 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
           POLICY_JSON: ${{ needs.gate.outputs.policy }}
         shell: bash
         run: |
           set -euo pipefail
           [ ! -e "${GITHUB_WORKSPACE}/pr-head" ] || { echo "::error::PR head checkout still present."; exit 1; }
           skip_labels="$(jq -c '.skipLabels' <<< "$POLICY_JSON")"
+          request_labels="$(jq -c '.requestLabels' <<< "$POLICY_JSON")"
+          # A draft only for a request-label event whose label the live PR still carries.
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" | jq -e \
-            --arg head "$PR_HEAD_SHA" --arg ref "$PR_BASE_REF" --arg repo "$GITHUB_REPOSITORY" --argjson skip "$skip_labels" '
-              .state == "open" and .draft == false and .head.sha == $head and .base.ref == $ref
+            --arg head "$PR_HEAD_SHA" --arg ref "$PR_BASE_REF" --arg repo "$GITHUB_REPOSITORY" --argjson skip "$skip_labels" \
+            --arg action "$EVENT_ACTION" --arg label "$LABEL_NAME" --argjson req "$request_labels" '
+              [.labels[].name] as $names
+              | .state == "open" and .head.sha == $head and .base.ref == $ref
+              and (.draft == false or ($action == "labeled" and ($req | index($label)) != null and ($names | index($label)) != null))
               and .head.repo.full_name == $repo and .head.repo.id == .base.repo.id
-              and ([.labels[].name] - $skip == [.labels[].name])' > /dev/null \
+              and ($names - $skip == $names)' > /dev/null \
             || { echo "::error::PR state changed before the credential was requested; not reviewing."; exit 1; }
 
       - name: Assume the shared Claude review role
@@ -545,7 +637,7 @@ jobs:
             head -c "$max_review_bytes" "$review_file" | iconv -f utf-8 -t utf-8 -c > "${review_file}.cut" || true
             printf '\n\n---\n\n_Review truncated at %s bytes before publication._\n' "$max_review_bytes" >> "${review_file}.cut"
             mv "${review_file}.cut" "$review_file"
-            echo "::warning::Claude review exceeded ${max_review_bytes} bytes and was truncated."
+            echo "::warning::Review exceeded ${max_review_bytes} bytes and was truncated."
           fi
           {
             echo "review_markdown_b64<<EOF"
@@ -555,7 +647,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publish Claude review
+    name: Publish review
     needs: [gate, review]
     if: >-
       always() && needs.gate.outputs.available == 'true' &&
@@ -565,14 +657,15 @@ jobs:
     # Serialize sticky writes per PR. GitHub keeps one running plus one pending member, so a third
     # overlapping publisher cancels the pending one; that fails toward "looks unreviewed".
     concurrency:
-      group: claude-review-publish-${{ github.event.pull_request.number }}
+      group: basic-pr-review-publish-${{ github.event.pull_request.number }}
       cancel-in-progress: false
     permissions:
       contents: read
       issues: write
       pull-requests: write
+      statuses: write
     steps:
-      - name: Publish sticky comment
+      - name: Publish sticky comment and status
         # Model output is only ever data here: decoded to a file, scrubbed, and sent as JSON.
         env:
           GH_TOKEN: ${{ github.token }}
@@ -580,6 +673,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
           REVIEW_RESULT: ${{ needs.review.result }}
           REVIEW_STATUS: ${{ needs.review.outputs.status }}
           REVIEW_MARKDOWN_B64: ${{ needs.review.outputs.review_markdown_b64 }}
@@ -593,14 +688,24 @@ jobs:
           review_file="${RUNNER_TEMP}/review.md"
           comments_file="${RUNNER_TEMP}/sticky-ids.txt"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          # Trusted identity markers. Model-written "<!-- claude-" comments are scrubbed below,
-          # so only this step can mint them.
-          complete_marker="<!-- claude-pr-review-complete head=${PR_HEAD_SHA} ref=${PR_BASE_REF} -->"
-          outdated_marker="<!-- claude-pr-review-outdated -->"
+          # Trusted identity markers. Model-written "<!-- basic-" and "<!-- claude-" comments are
+          # scrubbed below, so only this step can mint them. Legacy ones are read, never written.
+          complete_marker="<!-- basic-pr-review-complete head=${PR_HEAD_SHA} ref=${PR_BASE_REF} -->"
+          legacy_complete_marker="<!-- claude-pr-review-complete head=${PR_HEAD_SHA} ref=${PR_BASE_REF} -->"
+          outdated_marker="<!-- basic-pr-review-outdated -->"
+          legacy_outdated_marker="<!-- claude-pr-review-outdated -->"
 
           list_comments() {
             gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.STICKY_MARKER))) | .id'
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | (contains(env.STICKY_MARKER) or contains(env.LEGACY_STICKY_MARKER)))) | .id'
+          }
+          # Only ever for the live head: re-read just before posting.
+          post_status() {
+            [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')" = "$PR_HEAD_SHA" ] \
+              || { echo "::notice::Head moved; no status for ${PR_HEAD_SHA}."; return 0; }
+            jq -n --arg s "$1" --arg d "$2" --arg u "$run_url" --arg c "$STATUS_CONTEXT" \
+              '{state: $s, description: $d, target_url: $u, context: $c}' \
+              | gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" --input - > /dev/null
           }
           sticky_body() { gh api "repos/${GITHUB_REPOSITORY}/issues/comments/$1" --jq '.body'; }
           patch_comment() {
@@ -614,12 +719,13 @@ jobs:
             id="$(list_comments | head -n 1)"
             [ -n "$id" ] || return 0
             existing="$(sticky_body "$id")"
-            if printf '%s' "$existing" | grep -qF "<!-- claude-pr-review-complete head=$1 "; then return 0; fi
+            if printf '%s' "$existing" | grep -qF -e "<!-- basic-pr-review-complete head=$1 " -e "<!-- claude-pr-review-complete head=$1 "; then return 0; fi
             {
               echo "${STICKY_MARKER}"
               echo "> **Outdated:** the comment below does not describe the current head \`$1\` ($2). ${outdated_marker}"
               echo
-              printf '%s\n' "$existing" | grep -vF -e "${STICKY_MARKER}" -e "${outdated_marker}" || true
+              printf '%s\n' "$existing" | grep -vF -e "${STICKY_MARKER}" -e "${outdated_marker}" \
+                -e "${LEGACY_STICKY_MARKER}" -e "${legacy_outdated_marker}" || true
             } > "$body_file"
             patch_comment "$id" "$body_file"
           }
@@ -636,18 +742,34 @@ jobs:
             exit 0
           fi
           [ "$(jq -r '.base.ref' "$pr")" = "$PR_BASE_REF" ] || { echo "::notice::Not publishing: PR was retargeted."; exit 0; }
-          [ "$(jq -r '.draft' "$pr")" = "false" ] || { echo "::notice::Not publishing: PR is a draft."; exit 0; }
+          # A draft only for a request-label event whose label the live PR still carries.
+          request=false
+          if [ "$EVENT_ACTION" = "labeled" ] \
+            && jq -e --arg l "$LABEL_NAME" '.requestLabels | index($l)' <<< "$POLICY_JSON" > /dev/null \
+            && jq -e --arg l "$LABEL_NAME" '[.labels[].name] | index($l)' "$pr" > /dev/null; then
+            request=true
+          fi
+          [ "$(jq -r '.draft' "$pr")" = "false" ] || [ "$request" = true ] || { echo "::notice::Not publishing: PR is a draft."; exit 0; }
           jq -e --argjson skip "$skip_labels" '[.labels[].name] - $skip == [.labels[].name]' "$pr" > /dev/null \
             || { echo "::notice::Not publishing: PR now carries a skip label."; exit 0; }
+          # After a final answer for this head, so the label can be added again later. Kept after
+          # a failure so a job re-run still sees the request. GITHUB_TOKEN removal starts no run.
+          remove_request_label() {
+            [ "$request" = true ] || return 0
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/$(jq -rn --arg l "$LABEL_NAME" '$l | @uri')" > /dev/null \
+              || echo "::warning::Could not remove the request label; remove it before requesting again."
+          }
 
           if [ "$REVIEW_STATUS" = "excluded" ]; then
             mark_outdated "$PR_HEAD_SHA" "this head is excluded from review by policy"
+            post_status success "Exempt: every changed path is excluded by policy."
+            remove_request_label
             exit 0
           fi
 
           ok=false
           if [ "$REVIEW_STATUS" = "too-large" ]; then
-            printf '%s\n## Claude review\n\nNot reviewed: commit `%s` against `%s` @ `%s` exceeds the 250-path or 500,000-byte limit. Not an approval.\n' \
+            printf '%s\n## Basic PR Review\n\nNot reviewed: commit `%s` against `%s` @ `%s` exceeds the 250-path or 500,000-byte limit. Not an approval.\n' \
               "$STICKY_MARKER" "$PR_HEAD_SHA" "$PR_BASE_REF" "$TRUSTED_SHA" > "$body_file"
           elif [ "$REVIEW_RESULT" = "success" ] && [ -n "$REVIEW_MARKDOWN_B64" ]; then
             ok=true
@@ -660,7 +782,7 @@ jobs:
           let prev;
           do {
             prev = text;
-            text = text.replace(/<!--\s*claude-[\s\S]*?-->/gi, "");
+            text = text.replace(/<!--\s*(?:basic|claude)-[\s\S]*?-->/gi, "");
           } while (text !== prev);
           text = text
             .replace(/!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])?/g, "[image removed]")
@@ -674,7 +796,7 @@ jobs:
           NODE
             {
               echo "${STICKY_MARKER}"
-              echo "## Claude review"
+              echo "## Basic PR Review"
               echo
               echo "**Reviewed commit:** \`${PR_HEAD_SHA}\` against \`${PR_BASE_REF}\` @ \`${TRUSTED_SHA}\` ([run](${run_url})). Advisory; not an approval."
               echo
@@ -683,7 +805,7 @@ jobs:
               echo "${complete_marker}"
             } > "$body_file"
           else
-            printf '%s\n## Claude review\n\nClaude review did not complete for commit `%s` against `%s` @ `%s` (result `%s`, [run](%s)). Do not treat this PR as Claude-reviewed.\n' \
+            printf '%s\n## Basic PR Review\n\nThe review did not complete for commit `%s` against `%s` @ `%s` (result `%s`, [run](%s)). Do not treat this PR as reviewed.\n' \
               "$STICKY_MARKER" "$PR_HEAD_SHA" "$PR_BASE_REF" "$TRUSTED_SHA" "$REVIEW_RESULT" "$run_url" > "$body_file"
           fi
 
@@ -703,7 +825,7 @@ jobs:
           # Never replace a completed review of this same head and base branch with a notice.
           if [ "$ok" != true ] && [ -n "$comment_id" ]; then
             existing="$(sticky_body "$comment_id")" || { echo "::error::Could not read the sticky; not overwriting it."; exit 1; }
-            if printf '%s' "$existing" | grep -qF "$complete_marker"; then
+            if printf '%s' "$existing" | grep -qF -e "$complete_marker" -e "$legacy_complete_marker"; then
               echo "::notice::Keeping the completed review of ${PR_HEAD_SHA}; not replacing it with a notice."
               exit 0
             fi
@@ -723,6 +845,32 @@ jobs:
           # Converge on the oldest sticky; a leftover duplicate is cosmetic, so best effort.
           tail -n +2 "$comments_file" | while read -r dupe_id; do
             [ -n "$dupe_id" ] || continue
-            echo "::warning::Removing duplicate Claude review sticky ${dupe_id}."
+            echo "::warning::Removing duplicate review sticky ${dupe_id}."
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${dupe_id}" > /dev/null || true
           done
+
+          # The status follows what the sticky now says about this head. The verdict is read from
+          # the published body, the same text a later accept-label event re-reads.
+          if [ "$ok" != true ]; then
+            if [ "$REVIEW_STATUS" = "too-large" ]; then
+              post_status failure "Too large to review. Add a skip label to exempt this PR."
+              remove_request_label
+            else
+              post_status failure "The review did not complete; re-run the review job."
+            fi
+            exit 0
+          fi
+          verdict="$(awk '!/^<!-- basic-pr-review/ && NF { l = $0 } END { gsub(/^[ \t\r]+|[ \t\r]+$/, "", l); print l }' "$body_file")"
+          if [ "$(jq -r '.failOnImportant' <<< "$POLICY_JSON")" != "true" ]; then
+            post_status success "Review published for this head."
+          elif jq -e --argjson a "$(jq -c '.acceptFindingsLabels' <<< "$POLICY_JSON")" \
+              '[.labels[].name] - $a != [.labels[].name]' "$pr" > /dev/null; then
+            post_status success "Review published; findings accepted by label."
+          elif [ "$verdict" = "No Important findings." ]; then
+            post_status success "Review published; no Important findings."
+          elif [ "$verdict" = "Important findings found." ]; then
+            post_status failure "Important findings found. Fix them or add an accept label."
+          else
+            post_status failure "The published review has no verdict line; re-run the review."
+          fi
+          remove_request_label
