@@ -1,6 +1,6 @@
-# .github/workflows/claude-review.yml in each repository. Must stay pull_request_target: the
+# .github/workflows/basic-pr-review.yml in each repository. Must stay pull_request_target: the
 # shared role only trusts tokens whose ref is the default branch (see the README).
-name: Claude review
+name: Basic PR Review
 on:
   pull_request_target:
     # No branches filter: closed/retarget events must still cancel an in-flight review.
@@ -12,18 +12,22 @@ on:
       - converted_to_draft
       - closed
       - edited
+      - labeled
       - unlabeled
 permissions: {}
 jobs:
   review:
-    # One live review per PR; label noise, title edits and manual re-runs get their own group.
+    # One live review per PR. A review request label joins the live group and replaces an
+    # in-flight review; other label changes, title edits and manual re-runs get their own group.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number }}-${{ (github.run_attempt != '1' || github.event.action == 'unlabeled' || (github.event.action == 'edited' && !github.event.changes.base)) && github.run_id || 'live' }}
+      group: basic-pr-review-${{ github.event.pull_request.number }}-${{ (github.run_attempt != '1' || github.event.action == 'unlabeled' || (github.event.action == 'labeled' && github.event.label.name != 'request-pr-review') || (github.event.action == 'edited' && !github.event.changes.base)) && github.run_id || 'live' }}
       cancel-in-progress: true
     permissions:
       contents: read
       id-token: write
       issues: write
       pull-requests: write
+      statuses: write
     # Pinned to a full commit SHA, never a tag: the role trusts this exact job_workflow_ref.
-    uses: BASIC-BIT/claude-review/.github/workflows/review.yml@b1431cc7f787fc29237d42c1bc1a184dd1db5f2a # v1.1.0
+    # Replace the placeholder with the v1.2.0 release SHA once it exists.
+    uses: BASIC-BIT/basic-pr-review/.github/workflows/review.yml@REPLACE_WITH_V1_2_0_SHA # v1.2.0
