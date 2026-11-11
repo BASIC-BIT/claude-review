@@ -52,7 +52,8 @@ With `failOnImportant: true`, a review whose final line is `Important findings f
 status. Adding an accept label (default `pr-review-accepted`) turns it `success` without
 re-running the model: the workflow re-reads the published sticky for the current head and
 trusts it only when it was posted by `github-actions[bot]` and names that head in its
-completion marker. Removing the accept label re-reads the sticky the same way.
+completion marker. Removing the accept label re-reads the sticky the same way. On a draft, accept
+labels take effect when the PR is marked ready, which starts a fresh review.
 
 ### Defaults and overrides
 
@@ -137,7 +138,7 @@ Callers still on v1.0.0 (`5d39ea869f2938b341459e851e294d2f8d93155e`) need `.gith
 1. Replace `.github/workflows/claude-review.yml` with the new
    [`templates/caller.yml`](templates/caller.yml) saved as `.github/workflows/basic-pr-review.yml`.
    It changes three things, and all three are required:
-   - `uses:` is now `BASIC-BIT/basic-pr-review/.github/workflows/review.yml@<v1.2.0 SHA>`.
+   - `uses:` is now `BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@<v1.2.0 SHA>`.
    - The event list adds `labeled`, and the concurrency group lets `request-pr-review` replace a
      running review. If you change `requestLabels`, change that name in the group too.
    - The permissions block adds `statuses: write`. A called workflow's jobs cannot hold a

@@ -207,7 +207,7 @@ jobs:
               ;;
             unlabeled)
               if policy_has skipLabels "$LABEL_NAME"; then
-                [ "$(jq -r '.rerunOnUnskip' "$policy")" = "true" ] || mode=unskipped
+                if [ "$(jq -r '.rerunOnUnskip' "$policy")" = "true" ]; then mode=rerun; else mode=unskipped; fi
               elif [ "$fail_on_important" = true ] && policy_has acceptFindingsLabels "$LABEL_NAME"; then mode=verdict
               else stop "label removal does not request a review."
               fi
@@ -259,6 +259,10 @@ jobs:
               stop "status re-evaluated from the published review of ${PR_HEAD_SHA}."
               ;;
           esac
+
+          # Removing a skip label starts a review. Replace the exemption's success first, so a
+          # required status blocks from now until that review reports.
+          [ "$mode" != rerun ] || post_status pending "Skip label removed; review in progress."
 
           {
             echo "allowed_bots=$(jq -r '.allowedBotActors | join(",")' "$policy")"

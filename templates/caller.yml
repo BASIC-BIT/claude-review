@@ -30,4 +30,4 @@ jobs:
       statuses: write
     # Pinned to a full commit SHA, never a tag: the role trusts this exact job_workflow_ref.
     # Replace the placeholder with the v1.2.0 release SHA once it exists.
-    uses: BASIC-BIT/basic-pr-review/.github/workflows/review.yml@REPLACE_WITH_V1_2_0_SHA # v1.2.0
+    uses: BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@REPLACE_WITH_V1_2_0_SHA # v1.2.0
