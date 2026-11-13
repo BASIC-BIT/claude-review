@@ -28,5 +28,5 @@ jobs:
       issues: write
       pull-requests: write
       statuses: write
-    # Pinned to a full commit SHA, never a tag: the role trusts this exact job_workflow_ref.
-    uses: BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@003ffa8132db2f8658837e7c1ead3a7b161c1703 # v1.2.0
+    # Pinned to the major version tag, so v1 releases reach this repository without a change here.
+    uses: BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@v1

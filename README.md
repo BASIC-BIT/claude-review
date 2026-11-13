@@ -8,8 +8,8 @@ Claude. It runs on GitHub-hosted runners, needs no server, and never approves or
 
 1. Copy [`templates/caller.yml`](templates/caller.yml) to `.github/workflows/basic-pr-review.yml`
    on the default branch. Keep `pull_request_target`, the event list, the permissions block and
-   the pinned commit SHA. That file is the only one adoption needs.
-2. Ask the role owner to add the repository's OIDC subject to the role's trust policy. The trust policy is maintained privately; it allows the token only when `job_workflow_ref` is this workflow at an approved commit SHA, `ref` is the repository's default branch (so only `pull_request_target` callers qualify) and `sub` is an enrolled repository's `pull_request` subject.
+   the `@v1` pin. That file is the only one adoption needs.
+2. Ask the role owner to add the repository's OIDC subject to the role's trust policy. The trust policy is maintained privately; it allows the token only when `job_workflow_ref` is this workflow at a trusted tag (`v1`), `ref` is the repository's default branch (so only `pull_request_target` callers qualify) and `sub` is an enrolled repository's `pull_request` subject.
    Until then the token step fails and the sticky says the review did not complete.
 3. Remove the old reviewer workflow in the same change so each PR has one publisher.
 4. Optionally require the status (see [Requiring the review](#requiring-the-review)).
@@ -123,22 +123,31 @@ thread auto-resolution and the work ledger.
 
 ## Versioning
 
-Callers pin the release's full 40-character commit SHA (`@<sha> # v1.2.0`), never a tag, and the
-role's trust policy lists that same SHA in `job_workflow_ref`. A SHA cannot be moved, so the code
-the role trusts changes only when the trust policy does. A release means: add the new SHA to the
-trust policy beside the current one, update every caller's `uses:` to it, then remove the old SHA
-from trust. Both are accepted only during that rollout.
+Callers pin the major version tag (`@v1`), and the role's trust policy lists
+`...review.yml@refs/tags/v1` in `job_workflow_ref`. A compatible release moves the `v1` tag and
+reaches every caller at once, with no caller change and no trust-policy change. Each release also
+gets a fixed tag (`v1.2.0`) for reference.
 
-Current release: v1.2.0, `003ffa8132db2f8658837e7c1ead3a7b161c1703` (pinned in `templates/caller.yml`).
-Previous release: v1.1.0, `b1431cc7f787fc29237d42c1bc1a184dd1db5f2a`.
-Callers still on v1.0.0 (`5d39ea869f2938b341459e851e294d2f8d93155e`) need `.github/claude-review.json`.
+The trade: whoever can move the `v1` tag in this repository decides what code receives the
+shared credential in every calling repository. Before v1.2.0 callers pinned a commit SHA and the
+trust policy listed it, so trusted code changed only with a trust-policy change. Keep write
+access to this repository as narrow as the credential deserves.
+
+Releasing: move `v1-rc` to the candidate first. One low-stakes repository pins `@v1-rc`; open a PR
+there and watch one review complete. Then move `v1` to the same commit. A breaking change to the
+caller contract (events, permissions) is a new major tag and a new caller.
+
+Current release: v1.2.0, `003ffa8132db2f8658837e7c1ead3a7b161c1703`.
+Earlier releases were pinned by SHA from `BASIC-BIT/claude-review`: v1.1.0
+`b1431cc7f787fc29237d42c1bc1a184dd1db5f2a`, v1.0.0 `5d39ea869f2938b341459e851e294d2f8d93155e`
+(needs `.github/claude-review.json`).
 
 ### Upgrading from v1.1.0
 
 1. Replace `.github/workflows/claude-review.yml` with the new
    [`templates/caller.yml`](templates/caller.yml) saved as `.github/workflows/basic-pr-review.yml`.
    It changes three things, and all three are required:
-   - `uses:` is now `BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@<v1.2.0 SHA>`.
+   - `uses:` is now `BITRATE-Labs/basic-pr-review/.github/workflows/review.yml@v1`.
    - The event list adds `labeled`, and the concurrency group lets `request-pr-review` replace a
      running review. If you change `requestLabels`, change that name in the group too.
    - The permissions block adds `statuses: write`. A called workflow's jobs cannot hold a
