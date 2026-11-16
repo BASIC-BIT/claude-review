@@ -1,5 +1,7 @@
 # basic-pr-review
 
+> **Moved.** This workflow now lives at [BITRATE-Labs/basic-pr-review](https://github.com/BITRATE-Labs/basic-pr-review), and every caller pins it there. This repository is archived and no longer trusted by the review role; do not call it.
+
 One reusable GitHub Actions workflow that posts an advisory PR review as a single sticky PR
 comment and a `basic-pr-review` commit status. It is our homegrown reviewer; today the model is
 Claude. It runs on GitHub-hosted runners, needs no server, and never approves or merges.
